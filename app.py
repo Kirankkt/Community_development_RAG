@@ -68,15 +68,43 @@ def format_context(docs):
     return "\n\n---\n\n".join(parts)
 
 
+def clean_title(raw_title):
+    """Convert filenames like 'Some_Paper_Title_W3041277519.pdf' to readable titles."""
+    import re
+    t = str(raw_title or "Untitled")
+    t = re.sub(r'_W\d+\.pdf$', '', t)  # remove _W{digits}.pdf
+    t = re.sub(r'\.pdf$', '', t, flags=re.IGNORECASE)  # remove .pdf
+    t = t.replace('_', ' ')  # underscores to spaces
+    t = re.sub(r'\s+', ' ', t).strip()  # collapse whitespace
+    return t if t else "Untitled"
+
+
 def format_sources(docs):
-    lines = []
-    for i, doc in enumerate(docs, 1):
+    # Deduplicate by doc_id to show each paper only once
+    seen = {}
+    for doc in docs:
         md = doc.metadata
+        doc_id = md.get('doc_id', '?')
+        if doc_id not in seen:
+            seen[doc_id] = {
+                "title": clean_title(md.get('display_title', '')),
+                "year": md.get('year', '?'),
+                "geo": md.get('geo_scope', '?'),
+                "metric": md.get('metric_bucket_primary', '?'),
+                "pages": [],
+            }
+        seen[doc_id]["pages"].append(str(md.get('page', '?')))
+
+    lines = []
+    for i, (doc_id, info) in enumerate(seen.items(), 1):
+        pages = ", ".join(info["pages"])
+        year = info["year"]
+        if isinstance(year, float):
+            year = int(year)
         lines.append(
-            f"**[{i}] {md.get('doc_id','?')}** p.{md.get('page','?')}\n"
-            f"*{str(md.get('display_title',''))[:120]}* ({md.get('year','?')})\n"
-            f"Geo: {md.get('geo_scope','?')} | Metric: {md.get('metric_bucket_primary','?')}\n"
-            f"```\n{doc.page_content[:250]}...\n```\n"
+            f"**{i}. {info['title']}** ({year})\n"
+            f"   - Document: `{doc_id}` | Pages cited: {pages}\n"
+            f"   - Region: {info['geo']} | Topic: {info['metric']}\n"
         )
     return "\n".join(lines)
 
@@ -180,8 +208,10 @@ with gr.Blocks(
                 lines=3,
             )
             submit_btn = gr.Button("Ask", variant="primary", size="lg")
-            answer_box = gr.Markdown(label="Answer")
-            sources_box = gr.Markdown(label="Sources")
+            gr.Markdown("### Answer")
+            answer_box = gr.Markdown()
+            gr.Markdown("### Sources")
+            sources_box = gr.Markdown()
 
             submit_btn.click(
                 fn=respond,
