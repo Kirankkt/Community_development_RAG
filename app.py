@@ -198,15 +198,16 @@ with gr.Blocks(
         with gr.Column(scale=3):
             chatbot = gr.ChatInterface(
                 fn=chat_fn,
+                type="messages",
                 additional_inputs=[api_key, model, top_k],
                 examples=[
-                    "What is the role of Kudumbashree in poverty reduction?",
-                    "What indicators measure municipal service delivery in Kerala?",
-                    "How do gram panchayats contribute to decentralized governance?",
-                    "What are the challenges in solid waste management in Kerala?",
-                    "What is the impact of MGNREGA on rural employment in Kerala?",
+                    ["What is the role of Kudumbashree in poverty reduction?"],
+                    ["What indicators measure municipal service delivery in Kerala?"],
+                    ["How do gram panchayats contribute to decentralized governance?"],
+                    ["What are the challenges in solid waste management in Kerala?"],
+                    ["What is the impact of MGNREGA on rural employment in Kerala?"],
                 ],
-                chatbot=gr.Chatbot(height=500, show_copy_button=True),
+                chatbot=gr.Chatbot(height=500, show_copy_button=True, type="messages"),
             )
 
 
