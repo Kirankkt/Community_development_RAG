@@ -116,8 +116,16 @@ def format_sources(docs):
     return "\n".join(lines)
 
 
+def get_api_key(user_key: str) -> str:
+    """Use user-provided key, or fall back to environment variable."""
+    if user_key and user_key.strip():
+        return user_key.strip()
+    return os.environ.get("OPENAI_API_KEY", "")
+
+
 def rag_query(question: str, api_key: str, model: str, top_k: int):
-    if not api_key or not api_key.strip().startswith("sk-"):
+    resolved_key = get_api_key(api_key)
+    if not resolved_key:
         return "Please enter a valid OpenAI API key.", ""
 
     if not question.strip():
@@ -138,7 +146,7 @@ def rag_query(question: str, api_key: str, model: str, top_k: int):
          "QUESTION: {question}\n\n"
          "Provide a thorough, well-cited answer:"),
     ])
-    llm = ChatOpenAI(model=model, temperature=0.1, api_key=api_key.strip())
+    llm = ChatOpenAI(model=model, temperature=0.1, api_key=resolved_key)
     chain = prompt | llm
     response = chain.invoke({"context": context, "question": question})
 
@@ -170,13 +178,17 @@ with gr.Blocks(
         "and **GPT** with source citations."
     )
 
+    ENV_KEY_SET = bool(os.environ.get("OPENAI_API_KEY", ""))
+
     with gr.Row():
         with gr.Column(scale=1):
+            if ENV_KEY_SET:
+                gr.Markdown("**OpenAI API Key:** Set via environment secret")
             api_key = gr.Textbox(
-                label="OpenAI API Key",
+                label="OpenAI API Key (leave blank if set via secret)" if ENV_KEY_SET else "OpenAI API Key",
                 type="password",
-                placeholder="sk-...",
-                value=os.environ.get("OPENAI_API_KEY", ""),
+                placeholder="sk-..." if not ENV_KEY_SET else "Using environment secret",
+                value="",
             )
             model = gr.Dropdown(
                 choices=["gpt-4o-mini", "gpt-4o"],
