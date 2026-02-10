@@ -7,17 +7,15 @@ using 436 academic papers with hybrid search, reranking, and GPT citations.
 
 import os
 import pickle
+import gc
 
 import numpy as np
 import streamlit as st
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
-from langchain.retrievers import EnsembleRetriever
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from sentence_transformers import CrossEncoder
 
 # ---------------------------------------------------------------------------
 # Config
@@ -26,7 +24,6 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 FAISS_DIR = os.path.join(DATA_DIR, "faiss_index_bge_base")
 CHUNKS_PATH = os.path.join(DATA_DIR, "chunk_docs.pkl")
 EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 SYSTEM_PROMPT = """You are an expert research assistant specializing in Kerala community development, \
 local governance, decentralization, and Indian urban/rural development policy.
@@ -61,38 +58,21 @@ def load_vectorstore(_embeddings):
 @st.cache_resource(show_spinner="Loading document chunks...")
 def load_chunks():
     with open(CHUNKS_PATH, "rb") as f:
-        return pickle.load(f)
-
-
-@st.cache_resource(show_spinner="Building keyword index...")
-def load_bm25(_chunks):
-    return BM25Retriever.from_documents(_chunks, k=25)
-
-
-@st.cache_resource(show_spinner="Loading reranker...")
-def load_reranker():
-    return CrossEncoder(RERANKER_MODEL, max_length=512)
+        chunks = pickle.load(f)
+    return chunks
 
 
 # ---------------------------------------------------------------------------
 # RAG pipeline functions
 # ---------------------------------------------------------------------------
-def retrieve_and_rerank(query, ensemble_retriever, reranker, top_k=6):
-    """Hybrid retrieve -> cross-encoder rerank -> return top_k."""
-    candidates = ensemble_retriever.invoke(query)
-    if not candidates:
-        return []
-
-    pairs = [(query, doc.page_content) for doc in candidates]
-    scores = reranker.predict(pairs)
-
-    scored = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-
-    results = []
-    for doc, score in scored[:top_k]:
-        doc.metadata["reranker_score"] = float(score)
-        results.append(doc)
-    return results
+def retrieve(query, vectorstore, top_k=10):
+    """Dense retrieval from FAISS, return top_k."""
+    results = vectorstore.similarity_search_with_score(query, k=top_k)
+    docs = []
+    for doc, score in results:
+        doc.metadata["similarity_score"] = float(score)
+        docs.append(doc)
+    return docs
 
 
 def format_context(docs):
@@ -110,9 +90,9 @@ def format_context(docs):
     return "\n\n---\n\n".join(parts)
 
 
-def rag_query(question, ensemble_retriever, reranker, llm, top_k=6):
-    """Full RAG pipeline: retrieve + rerank + generate."""
-    docs = retrieve_and_rerank(question, ensemble_retriever, reranker, top_k)
+def rag_query(question, vectorstore, llm, top_k=6):
+    """Full RAG pipeline: retrieve + generate."""
+    docs = retrieve(question, vectorstore, top_k=top_k)
 
     if not docs:
         return {
@@ -149,7 +129,7 @@ def rag_query(question, ensemble_retriever, reranker, llm, top_k=6):
                 "year": md.get("year", "?"),
                 "geo_scope": md.get("geo_scope", "?"),
                 "metric": md.get("metric_bucket_primary", "?"),
-                "reranker_score": md.get("reranker_score", 0),
+                "score": md.get("similarity_score", 0),
                 "snippet": doc.page_content[:300],
             }
         )
@@ -181,8 +161,10 @@ def main():
             help="Enter your OpenAI API key. On Streamlit Cloud, set this in Secrets.",
         )
         if not api_key:
-            # Try Streamlit secrets
-            api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
+            try:
+                api_key = st.secrets.get("OPENAI_API_KEY", "")
+            except Exception:
+                api_key = ""
 
         model_choice = st.selectbox(
             "LLM Model",
@@ -195,8 +177,8 @@ def main():
         st.divider()
         st.header("About")
         st.markdown(
-            "This chatbot uses **hybrid search** (dense + BM25), "
-            "**cross-encoder reranking**, and **GPT** to answer questions "
+            "This chatbot uses **dense semantic search** (BGE embeddings + FAISS) "
+            "and **GPT** to answer questions "
             "grounded in academic literature on Kerala community development.\n\n"
             "Every claim includes a citation `[doc_id, p.X]` "
             "so you can trace it back to the source paper."
@@ -218,15 +200,6 @@ def main():
     # --- Load models and data ---
     embeddings = load_embeddings()
     vectorstore = load_vectorstore(embeddings)
-    chunks = load_chunks()
-    bm25_retriever = load_bm25(tuple(chunks))  # tuple for hashability
-    reranker = load_reranker()
-
-    dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 25})
-    ensemble_retriever = EnsembleRetriever(
-        retrievers=[dense_retriever, bm25_retriever],
-        weights=[0.6, 0.4],
-    )
 
     llm = ChatOpenAI(model=model_choice, temperature=0.1, api_key=api_key)
 
@@ -243,7 +216,7 @@ def main():
                     for i, s in enumerate(msg["sources"], 1):
                         st.markdown(
                             f"**[{i}] {s['doc_id']}** p.{s['page']} "
-                            f"(score: {s['reranker_score']:.2f})  \n"
+                            f"(score: {s['score']:.4f})  \n"
                             f"*{s['title']}* ({s['year']})  \n"
                             f"Geo: {s['geo_scope']} | Metric: {s['metric']}  \n"
                             f"```\n{s['snippet']}...\n```"
@@ -259,9 +232,7 @@ def main():
         # Generate answer
         with st.chat_message("assistant"):
             with st.spinner("Searching papers and generating answer..."):
-                result = rag_query(
-                    question, ensemble_retriever, reranker, llm, top_k=top_k
-                )
+                result = rag_query(question, vectorstore, llm, top_k=top_k)
 
             st.markdown(result["answer"])
 
@@ -270,7 +241,7 @@ def main():
                     for i, s in enumerate(result["sources"], 1):
                         st.markdown(
                             f"**[{i}] {s['doc_id']}** p.{s['page']} "
-                            f"(score: {s['reranker_score']:.2f})  \n"
+                            f"(score: {s['score']:.4f})  \n"
                             f"*{s['title']}* ({s['year']})  \n"
                             f"Geo: {s['geo_scope']} | Metric: {s['metric']}  \n"
                             f"```\n{s['snippet']}...\n```"
