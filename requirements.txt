@@ -1,12 +1,13 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
-streamlit>=1.35.0
+gradio>=4.40
 langchain==0.2.16
 langchain-community==0.2.16
 langchain-openai==0.1.23
 langchain-text-splitters==0.2.2
 sentence-transformers==3.0.1
 faiss-cpu>=1.8.0
+rank_bm25==0.2.2
 openai>=1.40
 numpy<2.0
 pandas==2.2.2
