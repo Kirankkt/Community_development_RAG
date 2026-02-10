@@ -189,6 +189,8 @@ def render_conversation(history):
 
 def respond(message, chat_history, api_key, model, top_k):
     """Process a message with full conversation context."""
+    if chat_history is None:
+        chat_history = []
     resolved_key = get_api_key(api_key)
     if not resolved_key:
         chat_history = chat_history + [
@@ -292,7 +294,7 @@ with gr.Blocks(
 
         with gr.Column(scale=3):
             # Hidden state for conversation history (list of dicts)
-            chat_state = gr.State([])
+            chat_state = gr.State(value=[])
 
             question = gr.Textbox(
                 label="Your Question",
