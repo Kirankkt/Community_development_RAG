@@ -81,26 +81,25 @@ def format_sources(docs):
     return "\n".join(lines)
 
 
-def get_api_key(user_key: str) -> str:
+def get_api_key(user_key):
     if user_key and user_key.strip():
         return user_key.strip()
     return os.environ.get("OPENAI_API_KEY", "")
 
 
-def respond(message, history, api_key, model, top_k):
+def respond(message, api_key, model, top_k):
+    """Single question -> answer. No chat history to avoid Chatbot schema bugs."""
     resolved_key = get_api_key(api_key)
     if not resolved_key:
-        history.append((message, "Please enter your OpenAI API key in the sidebar."))
-        return history, ""
+        return "Please enter your OpenAI API key in the sidebar.", ""
 
-    if not message.strip():
-        return history, ""
+    if not message or not message.strip():
+        return "Please enter a question.", ""
 
     # Retrieve from FAISS
     docs = vectorstore.similarity_search(message, k=int(top_k))
     if not docs:
-        history.append((message, "No relevant documents found for your query."))
-        return history, ""
+        return "No relevant documents found for your query.", ""
 
     # Generate
     context = format_context(docs)
@@ -118,20 +117,18 @@ def respond(message, history, api_key, model, top_k):
 
     answer = response.content
     sources = format_sources(docs)
-    full_response = answer + "\n\n---\n**Retrieved Sources:**\n\n" + sources
-
-    history.append((message, full_response))
-    return history, ""
+    return answer, sources
 
 
 # ---------------------------------------------------------------------------
-# Gradio UI — manual chat layout (avoids ChatInterface bugs)
+# Gradio UI — simple Interface (no Chatbot component)
 # ---------------------------------------------------------------------------
 ENV_KEY_SET = bool(os.environ.get("OPENAI_API_KEY", ""))
 
 with gr.Blocks(
     title="Kerala Community Development RAG",
     theme=gr.themes.Soft(primary_hue="green"),
+    analytics_enabled=False,
 ) as demo:
 
     gr.Markdown(
@@ -177,28 +174,28 @@ with gr.Blocks(
             )
 
         with gr.Column(scale=3):
-            chatbot = gr.Chatbot(height=550, show_copy_button=True, label="Chat")
-            msg = gr.Textbox(
-                label="Your question",
+            question = gr.Textbox(
+                label="Your Question",
                 placeholder="Ask about Kerala community development...",
-                lines=2,
+                lines=3,
             )
-            with gr.Row():
-                submit_btn = gr.Button("Ask", variant="primary")
-                clear_btn = gr.Button("Clear")
+            submit_btn = gr.Button("Ask", variant="primary", size="lg")
+            answer_box = gr.Markdown(label="Answer")
+            sources_box = gr.Markdown(label="Sources")
 
             submit_btn.click(
-                respond,
-                inputs=[msg, chatbot, api_key, model, top_k],
-                outputs=[chatbot, msg],
+                fn=respond,
+                inputs=[question, api_key, model, top_k],
+                outputs=[answer_box, sources_box],
+                api_name=False,
             )
-            msg.submit(
-                respond,
-                inputs=[msg, chatbot, api_key, model, top_k],
-                outputs=[chatbot, msg],
+            question.submit(
+                fn=respond,
+                inputs=[question, api_key, model, top_k],
+                outputs=[answer_box, sources_box],
+                api_name=False,
             )
-            clear_btn.click(lambda: ([], ""), outputs=[chatbot, msg])
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=7860, ssr=False)
