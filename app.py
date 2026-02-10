@@ -31,7 +31,8 @@ You answer questions using ONLY the provided source documents. Follow these rule
 3. Synthesize information across multiple sources when relevant.
 4. When sources disagree, note the disagreement and cite both sides.
 5. Keep answers focused, well-structured, and academic in tone.
-6. End with a "Sources Used" section listing all cited documents with their titles."""
+6. Do NOT include a "Sources Used" or "References" section at the end — sources are displayed separately by the system.
+7. Only cite sources that are directly relevant to the question. Ignore retrieved sources that are off-topic."""
 
 # ---------------------------------------------------------------------------
 # Load at startup
