@@ -174,6 +174,19 @@ def build_chat_messages(history, context, question):
     return messages
 
 
+def render_conversation(history):
+    """Render chat history as Markdown for display."""
+    if not history:
+        return "*No conversation yet. Ask a question to get started.*"
+    parts = []
+    for msg in history:
+        if msg["role"] == "user":
+            parts.append(f"**You:** {msg['content']}")
+        else:
+            parts.append(f"**Assistant:**\n\n{msg['content']}")
+    return "\n\n---\n\n".join(parts)
+
+
 def respond(message, chat_history, api_key, model, top_k):
     """Process a message with full conversation context."""
     resolved_key = get_api_key(api_key)
@@ -182,10 +195,10 @@ def respond(message, chat_history, api_key, model, top_k):
             {"role": "user", "content": message},
             {"role": "assistant", "content": "Please enter your OpenAI API key in the sidebar."},
         ]
-        return chat_history, "", ""
+        return chat_history, render_conversation(chat_history), "", ""
 
     if not message or not message.strip():
-        return chat_history, "", ""
+        return chat_history, render_conversation(chat_history), "", ""
 
     # Step 1: Reformulate query using conversation history
     standalone_query = reformulate_query(chat_history, message, resolved_key, model)
@@ -197,7 +210,7 @@ def respond(message, chat_history, api_key, model, top_k):
             {"role": "user", "content": message},
             {"role": "assistant", "content": "No relevant documents found for your query."},
         ]
-        return chat_history, "", ""
+        return chat_history, render_conversation(chat_history), "", ""
 
     # Step 3: Build prompt with conversation history + retrieved context
     context = format_context(docs)
@@ -218,12 +231,12 @@ def respond(message, chat_history, api_key, model, top_k):
         {"role": "assistant", "content": answer},
     ]
 
-    return chat_history, sources, ""
+    return chat_history, render_conversation(chat_history), sources, ""
 
 
 def clear_chat():
     """Reset conversation."""
-    return [], "", ""
+    return [], "*No conversation yet. Ask a question to get started.*", "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -278,41 +291,42 @@ with gr.Blocks(
             )
 
         with gr.Column(scale=3):
-            chatbot = gr.Chatbot(
-                label="Conversation",
-                type="messages",
-                height=500,
+            # Hidden state for conversation history (list of dicts)
+            chat_state = gr.State([])
+
+            question = gr.Textbox(
+                label="Your Question",
+                placeholder="Ask about Kerala community development...",
+                lines=2,
             )
             with gr.Row():
-                question = gr.Textbox(
-                    label="Your Question",
-                    placeholder="Ask about Kerala community development...",
-                    lines=2,
-                    scale=4,
-                )
-                submit_btn = gr.Button("Ask", variant="primary", size="lg", scale=1)
-            clear_btn = gr.Button("Clear Chat", variant="secondary", size="sm")
+                submit_btn = gr.Button("Ask", variant="primary", size="lg")
+                clear_btn = gr.Button("Clear Chat", variant="secondary", size="lg")
 
+            gr.Markdown("### Conversation")
+            conversation_box = gr.Markdown(
+                value="*No conversation yet. Ask a question to get started.*"
+            )
             gr.Markdown("### Sources (for latest answer)")
             sources_box = gr.Markdown()
 
             # Wire up events
             submit_btn.click(
                 fn=respond,
-                inputs=[question, chatbot, api_key, model, top_k],
-                outputs=[chatbot, sources_box, question],
+                inputs=[question, chat_state, api_key, model, top_k],
+                outputs=[chat_state, conversation_box, sources_box, question],
                 api_name=False,
             )
             question.submit(
                 fn=respond,
-                inputs=[question, chatbot, api_key, model, top_k],
-                outputs=[chatbot, sources_box, question],
+                inputs=[question, chat_state, api_key, model, top_k],
+                outputs=[chat_state, conversation_box, sources_box, question],
                 api_name=False,
             )
             clear_btn.click(
                 fn=clear_chat,
                 inputs=[],
-                outputs=[chatbot, sources_box, question],
+                outputs=[chat_state, conversation_box, sources_box, question],
                 api_name=False,
             )
 
