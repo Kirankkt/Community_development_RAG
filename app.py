@@ -6,26 +6,20 @@ on Kerala governance and development using FAISS + BGE embeddings + GPT.
 """
 
 import os
-import pickle
+import gc
 
 import gradio as gr
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
-from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from sentence_transformers import CrossEncoder
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 FAISS_DIR = os.path.join(DATA_DIR, "faiss_index_bge_base")
-CHUNKS_PATH = os.path.join(DATA_DIR, "chunk_docs.pkl")
 EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 SYSTEM_PROMPT = """You are an expert research assistant specializing in Kerala community development, \
 local governance, decentralization, and Indian urban/rural development policy.
@@ -40,7 +34,8 @@ You answer questions using ONLY the provided source documents. Follow these rule
 6. End with a "Sources Used" section listing all cited documents with their titles."""
 
 # ---------------------------------------------------------------------------
-# Load everything at startup (runs once when Space boots)
+# Load at startup: only embedding model + FAISS index (~600MB total)
+# No BM25, no reranker — keeps memory well under 16GB limit
 # ---------------------------------------------------------------------------
 print("Loading embedding model...")
 embeddings = HuggingFaceEmbeddings(
@@ -52,41 +47,13 @@ embeddings = HuggingFaceEmbeddings(
 print("Loading FAISS index...")
 vectorstore = FAISS.load_local(FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
 
-print("Loading chunks for BM25...")
-with open(CHUNKS_PATH, "rb") as f:
-    chunk_docs = pickle.load(f)
-
-print("Building BM25 index...")
-bm25_retriever = BM25Retriever.from_documents(chunk_docs, k=25)
-dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 25})
-ensemble_retriever = EnsembleRetriever(
-    retrievers=[dense_retriever, bm25_retriever],
-    weights=[0.6, 0.4],
-)
-
-print("Loading reranker...")
-reranker = CrossEncoder(RERANKER_MODEL, max_length=512)
-
+gc.collect()
 print("All models loaded!")
 
 
 # ---------------------------------------------------------------------------
 # RAG pipeline
 # ---------------------------------------------------------------------------
-def retrieve_and_rerank(query: str, top_k: int = 6):
-    candidates = ensemble_retriever.invoke(query)
-    if not candidates:
-        return []
-    pairs = [(query, doc.page_content) for doc in candidates]
-    scores = reranker.predict(pairs)
-    scored = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-    results = []
-    for doc, score in scored[:top_k]:
-        doc.metadata["reranker_score"] = float(score)
-        results.append(doc)
-    return results
-
-
 def format_context(docs):
     parts = []
     for i, doc in enumerate(docs, 1):
@@ -107,8 +74,7 @@ def format_sources(docs):
     for i, doc in enumerate(docs, 1):
         md = doc.metadata
         lines.append(
-            f"**[{i}] {md.get('doc_id','?')}** p.{md.get('page','?')} "
-            f"(score: {md.get('reranker_score', 0):.2f})\n"
+            f"**[{i}] {md.get('doc_id','?')}** p.{md.get('page','?')}\n"
             f"*{str(md.get('display_title',''))[:120]}* ({md.get('year','?')})\n"
             f"Geo: {md.get('geo_scope','?')} | Metric: {md.get('metric_bucket_primary','?')}\n"
             f"```\n{doc.page_content[:250]}...\n```\n"
@@ -131,8 +97,8 @@ def rag_query(question: str, api_key: str, model: str, top_k: int):
     if not question.strip():
         return "Please enter a question.", ""
 
-    # Retrieve and rerank
-    docs = retrieve_and_rerank(question, top_k=int(top_k))
+    # Retrieve from FAISS
+    docs = vectorstore.similarity_search(question, k=int(top_k))
     if not docs:
         return "No relevant documents found for your query.", ""
 
@@ -154,31 +120,31 @@ def rag_query(question: str, api_key: str, model: str, top_k: int):
 
 
 def chat_fn(message, history, api_key, model, top_k):
-    """Gradio chat handler — yields streaming-style output."""
+    """Gradio chat handler."""
     answer, sources = rag_query(message, api_key, model, top_k)
     full = answer
     if sources:
-        full += "\n\n---\n\n<details><summary>📚 View Retrieved Sources</summary>\n\n" + sources + "\n</details>"
+        full += "\n\n---\n\n<details><summary>View Retrieved Sources</summary>\n\n" + sources + "\n</details>"
     return full
 
 
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
+ENV_KEY_SET = bool(os.environ.get("OPENAI_API_KEY", ""))
+
 with gr.Blocks(
     title="Kerala Community Development RAG",
     theme=gr.themes.Soft(primary_hue="green"),
 ) as demo:
 
     gr.Markdown(
-        "# 📚 Kerala Community Development RAG\n"
+        "# Kerala Community Development RAG\n"
         "Ask questions about **436 academic papers** on Kerala governance, "
         "decentralization, and development policy.\n\n"
-        "Uses **hybrid search** (FAISS + BM25), **cross-encoder reranking**, "
+        "Uses **FAISS semantic search** (BGE embeddings) "
         "and **GPT** with source citations."
     )
-
-    ENV_KEY_SET = bool(os.environ.get("OPENAI_API_KEY", ""))
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -187,7 +153,7 @@ with gr.Blocks(
             api_key = gr.Textbox(
                 label="OpenAI API Key (leave blank if set via secret)" if ENV_KEY_SET else "OpenAI API Key",
                 type="password",
-                placeholder="sk-..." if not ENV_KEY_SET else "Using environment secret",
+                placeholder="Using environment secret" if ENV_KEY_SET else "sk-...",
                 value="",
             )
             model = gr.Dropdown(
@@ -203,7 +169,7 @@ with gr.Blocks(
                 "---\n"
                 "**How it works:**\n"
                 "1. Your question is searched against 19,555 chunks from 436 papers\n"
-                "2. Top candidates are re-ranked by a cross-encoder\n"
+                "2. Best matching passages are retrieved via semantic search\n"
                 "3. GPT generates an answer with `[doc_id, p.X]` citations\n"
             )
 
