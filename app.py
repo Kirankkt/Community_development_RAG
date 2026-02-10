@@ -3,10 +3,12 @@ Kerala Community Development RAG Chatbot
 =========================================
 Gradio app for HuggingFace Spaces. Answers questions about 436 academic papers
 on Kerala governance and development using FAISS + BGE embeddings + GPT.
+Supports multi-turn conversation with query reformulation.
 """
 
 import os
 import gc
+import re
 
 import gradio as gr
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -32,7 +34,21 @@ You answer questions using ONLY the provided source documents. Follow these rule
 4. When sources disagree, note the disagreement and cite both sides.
 5. Keep answers focused, well-structured, and academic in tone.
 6. Do NOT include a "Sources Used" or "References" section at the end — sources are displayed separately by the system.
-7. Only cite sources that are directly relevant to the question. Ignore retrieved sources that are off-topic."""
+7. Only cite sources that are directly relevant to the question. Ignore retrieved sources that are off-topic.
+8. You have access to the conversation history. Use it to understand follow-up questions and maintain context across turns."""
+
+REFORMULATE_PROMPT = """Given the conversation history below, rewrite the user's latest message as a \
+standalone search query that captures the full context. The query will be used to search a database \
+of academic papers on Kerala community development and governance.
+
+Output ONLY the rewritten query, nothing else.
+
+CONVERSATION HISTORY:
+{history}
+
+LATEST USER MESSAGE: {question}
+
+STANDALONE QUERY:"""
 
 # ---------------------------------------------------------------------------
 # Load at startup
@@ -71,17 +87,15 @@ def format_context(docs):
 
 def clean_title(raw_title):
     """Convert filenames like 'Some_Paper_Title_W3041277519.pdf' to readable titles."""
-    import re
     t = str(raw_title or "Untitled")
-    t = re.sub(r'_W\d+\.pdf$', '', t)  # remove _W{digits}.pdf
-    t = re.sub(r'\.pdf$', '', t, flags=re.IGNORECASE)  # remove .pdf
-    t = t.replace('_', ' ')  # underscores to spaces
-    t = re.sub(r'\s+', ' ', t).strip()  # collapse whitespace
+    t = re.sub(r'_W\d+\.pdf$', '', t)
+    t = re.sub(r'\.pdf$', '', t, flags=re.IGNORECASE)
+    t = t.replace('_', ' ')
+    t = re.sub(r'\s+', ' ', t).strip()
     return t if t else "Untitled"
 
 
 def format_sources(docs):
-    # Deduplicate by doc_id to show each paper only once
     seen = {}
     for doc in docs:
         md = doc.metadata
@@ -116,41 +130,104 @@ def get_api_key(user_key):
     return os.environ.get("OPENAI_API_KEY", "")
 
 
-def respond(message, api_key, model, top_k):
-    """Single question -> answer. No chat history to avoid Chatbot schema bugs."""
+def reformulate_query(history, question, api_key, model):
+    """Rewrite a follow-up question as a standalone query using conversation context."""
+    if not history:
+        return question
+
+    # Build a compact history string from the last 6 messages (3 turns)
+    recent = history[-6:]
+    history_str = "\n".join(
+        f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content'][:300]}"
+        for msg in recent
+    )
+
+    llm = ChatOpenAI(model=model, temperature=0, api_key=api_key, max_tokens=150)
+    prompt = ChatPromptTemplate.from_messages([
+        ("human", REFORMULATE_PROMPT),
+    ])
+    chain = prompt | llm
+    result = chain.invoke({"history": history_str, "question": question})
+    standalone = result.content.strip()
+    return standalone if standalone else question
+
+
+def build_chat_messages(history, context, question):
+    """Build the message list for the LLM, including conversation history."""
+    messages = [("system", SYSTEM_PROMPT)]
+
+    # Include the last 6 messages of conversation for context
+    # Gradio uses "user"/"assistant", LangChain expects "human"/"ai"
+    recent = history[-6:]
+    for msg in recent:
+        role = "human" if msg["role"] == "user" else "ai"
+        messages.append((role, msg["content"]))
+
+    # Final user message with retrieved sources
+    messages.append((
+        "human",
+        "Based on the following source documents, answer the question.\n\n"
+        f"SOURCES:\n{context}\n\n"
+        f"QUESTION: {question}\n\n"
+        "Provide a thorough, well-cited answer:"
+    ))
+    return messages
+
+
+def respond(message, chat_history, api_key, model, top_k):
+    """Process a message with full conversation context."""
     resolved_key = get_api_key(api_key)
     if not resolved_key:
-        return "Please enter your OpenAI API key in the sidebar.", ""
+        chat_history = chat_history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "Please enter your OpenAI API key in the sidebar."},
+        ]
+        return chat_history, "", ""
 
     if not message or not message.strip():
-        return "Please enter a question.", ""
+        return chat_history, "", ""
 
-    # Retrieve from FAISS
-    docs = vectorstore.similarity_search(message, k=int(top_k))
+    # Step 1: Reformulate query using conversation history
+    standalone_query = reformulate_query(chat_history, message, resolved_key, model)
+
+    # Step 2: Retrieve from FAISS using the standalone query
+    docs = vectorstore.similarity_search(standalone_query, k=int(top_k))
     if not docs:
-        return "No relevant documents found for your query.", ""
+        chat_history = chat_history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "No relevant documents found for your query."},
+        ]
+        return chat_history, "", ""
 
-    # Generate
+    # Step 3: Build prompt with conversation history + retrieved context
     context = format_context(docs)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human",
-         "Based on the following source documents, answer the question.\n\n"
-         "SOURCES:\n{context}\n\n"
-         "QUESTION: {question}\n\n"
-         "Provide a thorough, well-cited answer:"),
-    ])
+    messages = build_chat_messages(chat_history, context, message)
+    prompt = ChatPromptTemplate.from_messages(messages)
+
+    # Step 4: Generate answer
     llm = ChatOpenAI(model=model, temperature=0.1, api_key=resolved_key)
     chain = prompt | llm
-    response = chain.invoke({"context": context, "question": message})
+    response = chain.invoke({})
 
     answer = response.content
     sources = format_sources(docs)
-    return answer, sources
+
+    # Step 5: Update chat history
+    chat_history = chat_history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": answer},
+    ]
+
+    return chat_history, sources, ""
+
+
+def clear_chat():
+    """Reset conversation."""
+    return [], "", ""
 
 
 # ---------------------------------------------------------------------------
-# Gradio UI — simple Interface (no Chatbot component)
+# Gradio UI — conversational interface
 # ---------------------------------------------------------------------------
 ENV_KEY_SET = bool(os.environ.get("OPENAI_API_KEY", ""))
 
@@ -164,8 +241,7 @@ with gr.Blocks(
         "# Kerala Community Development RAG\n"
         "Ask questions about **436 academic papers** on Kerala governance, "
         "decentralization, and development policy.\n\n"
-        "Uses **FAISS semantic search** (BGE embeddings) "
-        "and **GPT** with source citations."
+        "Supports **follow-up questions** — ask a question, then dig deeper."
     )
 
     with gr.Row():
@@ -191,39 +267,52 @@ with gr.Blocks(
                 "---\n"
                 "**How it works:**\n"
                 "1. Your question is searched against 19,555 chunks from 436 papers\n"
-                "2. Best matching passages are retrieved via semantic search\n"
+                "2. Follow-up questions are automatically reformulated for better search\n"
                 "3. GPT generates an answer with `[doc_id, p.X]` citations\n"
             )
             gr.Markdown(
-                "---\n**Example questions:**\n"
-                "- What is the role of Kudumbashree in poverty reduction?\n"
-                "- What indicators measure municipal service delivery in Kerala?\n"
-                "- How do gram panchayats contribute to decentralized governance?\n"
-                "- What are the challenges in solid waste management in Kerala?\n"
+                "---\n**Try a conversation:**\n"
+                "1. *What is Kudumbashree?*\n"
+                "2. *How does it help women specifically?*\n"
+                "3. *What about in Trivandrum?*\n"
             )
 
         with gr.Column(scale=3):
-            question = gr.Textbox(
-                label="Your Question",
-                placeholder="Ask about Kerala community development...",
-                lines=3,
+            chatbot = gr.Chatbot(
+                label="Conversation",
+                type="messages",
+                height=500,
             )
-            submit_btn = gr.Button("Ask", variant="primary", size="lg")
-            gr.Markdown("### Answer")
-            answer_box = gr.Markdown()
-            gr.Markdown("### Sources")
+            with gr.Row():
+                question = gr.Textbox(
+                    label="Your Question",
+                    placeholder="Ask about Kerala community development...",
+                    lines=2,
+                    scale=4,
+                )
+                submit_btn = gr.Button("Ask", variant="primary", size="lg", scale=1)
+            clear_btn = gr.Button("Clear Chat", variant="secondary", size="sm")
+
+            gr.Markdown("### Sources (for latest answer)")
             sources_box = gr.Markdown()
 
+            # Wire up events
             submit_btn.click(
                 fn=respond,
-                inputs=[question, api_key, model, top_k],
-                outputs=[answer_box, sources_box],
+                inputs=[question, chatbot, api_key, model, top_k],
+                outputs=[chatbot, sources_box, question],
                 api_name=False,
             )
             question.submit(
                 fn=respond,
-                inputs=[question, api_key, model, top_k],
-                outputs=[answer_box, sources_box],
+                inputs=[question, chatbot, api_key, model, top_k],
+                outputs=[chatbot, sources_box, question],
+                api_name=False,
+            )
+            clear_btn.click(
+                fn=clear_chat,
+                inputs=[],
+                outputs=[chatbot, sources_box, question],
                 api_name=False,
             )
 
