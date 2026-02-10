@@ -34,8 +34,7 @@ You answer questions using ONLY the provided source documents. Follow these rule
 6. End with a "Sources Used" section listing all cited documents with their titles."""
 
 # ---------------------------------------------------------------------------
-# Load at startup: only embedding model + FAISS index (~600MB total)
-# No BM25, no reranker — keeps memory well under 16GB limit
+# Load at startup
 # ---------------------------------------------------------------------------
 print("Loading embedding model...")
 embeddings = HuggingFaceEmbeddings(
@@ -83,24 +82,25 @@ def format_sources(docs):
 
 
 def get_api_key(user_key: str) -> str:
-    """Use user-provided key, or fall back to environment variable."""
     if user_key and user_key.strip():
         return user_key.strip()
     return os.environ.get("OPENAI_API_KEY", "")
 
 
-def rag_query(question: str, api_key: str, model: str, top_k: int):
+def respond(message, history, api_key, model, top_k):
     resolved_key = get_api_key(api_key)
     if not resolved_key:
-        return "Please enter a valid OpenAI API key.", ""
+        history.append((message, "Please enter your OpenAI API key in the sidebar."))
+        return history, ""
 
-    if not question.strip():
-        return "Please enter a question.", ""
+    if not message.strip():
+        return history, ""
 
     # Retrieve from FAISS
-    docs = vectorstore.similarity_search(question, k=int(top_k))
+    docs = vectorstore.similarity_search(message, k=int(top_k))
     if not docs:
-        return "No relevant documents found for your query.", ""
+        history.append((message, "No relevant documents found for your query."))
+        return history, ""
 
     # Generate
     context = format_context(docs)
@@ -114,22 +114,18 @@ def rag_query(question: str, api_key: str, model: str, top_k: int):
     ])
     llm = ChatOpenAI(model=model, temperature=0.1, api_key=resolved_key)
     chain = prompt | llm
-    response = chain.invoke({"context": context, "question": question})
+    response = chain.invoke({"context": context, "question": message})
 
-    return response.content, format_sources(docs)
+    answer = response.content
+    sources = format_sources(docs)
+    full_response = answer + "\n\n---\n**Retrieved Sources:**\n\n" + sources
 
-
-def chat_fn(message, history, api_key, model, top_k):
-    """Gradio chat handler."""
-    answer, sources = rag_query(message, api_key, model, top_k)
-    full = answer
-    if sources:
-        full += "\n\n---\n\n<details><summary>View Retrieved Sources</summary>\n\n" + sources + "\n</details>"
-    return full
+    history.append((message, full_response))
+    return history, ""
 
 
 # ---------------------------------------------------------------------------
-# Gradio UI
+# Gradio UI — manual chat layout (avoids ChatInterface bugs)
 # ---------------------------------------------------------------------------
 ENV_KEY_SET = bool(os.environ.get("OPENAI_API_KEY", ""))
 
@@ -172,21 +168,36 @@ with gr.Blocks(
                 "2. Best matching passages are retrieved via semantic search\n"
                 "3. GPT generates an answer with `[doc_id, p.X]` citations\n"
             )
+            gr.Markdown(
+                "---\n**Example questions:**\n"
+                "- What is the role of Kudumbashree in poverty reduction?\n"
+                "- What indicators measure municipal service delivery in Kerala?\n"
+                "- How do gram panchayats contribute to decentralized governance?\n"
+                "- What are the challenges in solid waste management in Kerala?\n"
+            )
 
         with gr.Column(scale=3):
-            chatbot = gr.ChatInterface(
-                fn=chat_fn,
-                type="messages",
-                additional_inputs=[api_key, model, top_k],
-                examples=[
-                    ["What is the role of Kudumbashree in poverty reduction?"],
-                    ["What indicators measure municipal service delivery in Kerala?"],
-                    ["How do gram panchayats contribute to decentralized governance?"],
-                    ["What are the challenges in solid waste management in Kerala?"],
-                    ["What is the impact of MGNREGA on rural employment in Kerala?"],
-                ],
-                chatbot=gr.Chatbot(height=500, show_copy_button=True, type="messages"),
+            chatbot = gr.Chatbot(height=550, show_copy_button=True, label="Chat")
+            msg = gr.Textbox(
+                label="Your question",
+                placeholder="Ask about Kerala community development...",
+                lines=2,
             )
+            with gr.Row():
+                submit_btn = gr.Button("Ask", variant="primary")
+                clear_btn = gr.Button("Clear")
+
+            submit_btn.click(
+                respond,
+                inputs=[msg, chatbot, api_key, model, top_k],
+                outputs=[chatbot, msg],
+            )
+            msg.submit(
+                respond,
+                inputs=[msg, chatbot, api_key, model, top_k],
+                outputs=[chatbot, msg],
+            )
+            clear_btn.click(lambda: ([], ""), outputs=[chatbot, msg])
 
 
 if __name__ == "__main__":
